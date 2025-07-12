@@ -42,6 +42,22 @@ contract PaymentProcessorERC1155 is ERC1155, AccessControl, Pausable, Reentrancy
     mapping(address => bool) public authorizedProcessors;
     mapping(bytes32 => bool) public processedTransactions;
     
+    // Pre-mint system for payment confirmations
+    struct PreMintToken {
+        uint256 tokenId;
+        address merchant;
+        string productId;
+        string paymentProvider; // "apple_pay", "stripe", "paypal", etc.
+        uint256 price; // Price in wei (for tracking)
+        string metadata; // JSON metadata
+        bool isActive;
+        uint256 createdAt;
+    }
+    
+    mapping(uint256 => PreMintToken) public preMintTokens;
+    mapping(string => uint256) public paymentIntentToTokenId; // payment_intent_id -> tokenId
+    uint256 private _preMintTokenCounter;
+    
     // Events
     event TokenCreated(uint256 indexed tokenId, address indexed merchant, string productId, uint256 maxSupply);
     event NFTMintedForPurchase(
@@ -55,6 +71,29 @@ contract PaymentProcessorERC1155 is ERC1155, AccessControl, Pausable, Reentrancy
     event PaymentProcessorRemoved(address indexed processor);
     event MerchantAdded(address indexed merchant);
     event MerchantRemoved(address indexed merchant);
+    
+    // Pre-mint events
+    event PreMintTokenCreated(
+        uint256 indexed preMintId,
+        uint256 indexed tokenId,
+        address indexed merchant,
+        string productId,
+        string paymentProvider,
+        uint256 price
+    );
+    event PaymentConfirmed(
+        string indexed paymentIntentId,
+        uint256 indexed preMintId,
+        address indexed customer,
+        string paymentProvider,
+        uint256 amount
+    );
+    event NFTAutoMinted(
+        uint256 indexed tokenId,
+        address indexed customer,
+        string paymentIntentId,
+        string paymentProvider
+    );
 
     constructor(
         string memory _name,
@@ -334,6 +373,190 @@ contract PaymentProcessorERC1155 is ERC1155, AccessControl, Pausable, Reentrancy
         returns (bool)
     {
         return super.supportsInterface(interfaceId);
+    }
+
+    // ============ PRE-MINT SYSTEM FOR PAYMENT CONFIRMATIONS ============
+    
+    /**
+     * @dev Create a pre-mint token that will be automatically minted upon payment confirmation
+     * @param tokenId The token ID to mint (must exist)
+     * @param productId Product identifier
+     * @param paymentProvider Payment provider name ("apple_pay", "stripe", "paypal", etc.)
+     * @param price Price in wei for tracking purposes
+     * @param metadata JSON metadata for the NFT
+     */
+    function createPreMintToken(
+        uint256 tokenId,
+        string memory productId,
+        string memory paymentProvider,
+        uint256 price,
+        string memory metadata
+    ) external onlyRole(MERCHANT_ROLE) returns (uint256 preMintId) {
+        require(tokenExists[tokenId], "Token does not exist");
+        require(bytes(productId).length > 0, "Product ID required");
+        require(bytes(paymentProvider).length > 0, "Payment provider required");
+        
+        preMintId = _preMintTokenCounter++;
+        
+        preMintTokens[preMintId] = PreMintToken({
+            tokenId: tokenId,
+            merchant: msg.sender,
+            productId: productId,
+            paymentProvider: paymentProvider,
+            price: price,
+            metadata: metadata,
+            isActive: true,
+            createdAt: block.timestamp
+        });
+        
+        emit PreMintTokenCreated(
+            preMintId,
+            tokenId,
+            msg.sender,
+            productId,
+            paymentProvider,
+            price
+        );
+        
+        return preMintId;
+    }
+    
+    /**
+     * @dev Confirm payment and automatically mint NFT to customer
+     * Called by payment processors when payment is confirmed
+     * @param paymentIntentId Unique payment intent ID from payment provider
+     * @param preMintId The pre-mint token ID
+     * @param customer Customer address to receive the NFT
+     * @param amount Amount paid (for verification)
+     */
+    function confirmPaymentAndMint(
+        string memory paymentIntentId,
+        uint256 preMintId,
+        address customer,
+        uint256 amount
+    ) external onlyRole(PAYMENT_PROCESSOR_ROLE) nonReentrant {
+        _confirmPaymentAndMintInternal(paymentIntentId, preMintId, customer, amount);
+    }
+    
+    /**
+     * @dev Internal function to confirm payment and mint (used by batch)
+     */
+    function _confirmPaymentAndMintInternal(
+        string memory paymentIntentId,
+        uint256 preMintId,
+        address customer,
+        uint256 amount
+    ) internal {
+        require(customer != address(0), "Invalid customer address");
+        require(bytes(paymentIntentId).length > 0, "Payment intent ID required");
+        require(preMintTokens[preMintId].isActive, "Pre-mint token not active");
+        require(paymentIntentToTokenId[paymentIntentId] == 0, "Payment already processed");
+        
+        PreMintToken storage preMint = preMintTokens[preMintId];
+        
+        // Verify payment amount matches expected price (optional check)
+        if (preMint.price > 0) {
+            require(amount >= preMint.price, "Insufficient payment amount");
+        }
+        
+        // Check supply limits
+        if (maxSupply[preMint.tokenId] > 0) {
+            require(tokenSupply[preMint.tokenId] + 1 <= maxSupply[preMint.tokenId], "Exceeds maximum supply");
+        }
+        
+        // Mark payment as processed
+        paymentIntentToTokenId[paymentIntentId] = preMint.tokenId;
+        tokenSupply[preMint.tokenId] += 1;
+        
+        // Mint the NFT to customer
+        _mint(customer, preMint.tokenId, 1, "");
+        
+        // Emit events
+        emit PaymentConfirmed(
+            paymentIntentId,
+            preMintId,
+            customer,
+            preMint.paymentProvider,
+            amount
+        );
+        
+        emit NFTAutoMinted(
+            preMint.tokenId,
+            customer,
+            paymentIntentId,
+            preMint.paymentProvider
+        );
+        
+        emit NFTMintedForPurchase(
+            preMint.tokenId,
+            customer,
+            preMint.merchant,
+            paymentIntentId,
+            1
+        );
+    }
+
+    /**
+     * @dev Batch confirm multiple payments and mint NFTs
+     * @param paymentIntentIds Array of payment intent IDs
+     * @param preMintIds Array of pre-mint token IDs
+     * @param customers Array of customer addresses
+     * @param amounts Array of payment amounts
+     */
+    function batchConfirmPaymentsAndMint(
+        string[] memory paymentIntentIds,
+        uint256[] memory preMintIds,
+        address[] memory customers,
+        uint256[] memory amounts
+    ) external onlyRole(PAYMENT_PROCESSOR_ROLE) nonReentrant {
+        require(
+            paymentIntentIds.length == preMintIds.length &&
+            preMintIds.length == customers.length &&
+            customers.length == amounts.length,
+            "Array lengths must match"
+        );
+        
+        for (uint256 i = 0; i < paymentIntentIds.length; i++) {
+            _confirmPaymentAndMintInternal(
+                paymentIntentIds[i],
+                preMintIds[i],
+                customers[i],
+                amounts[i]
+            );
+        }
+    }
+    
+    /**
+     * @dev Deactivate a pre-mint token (merchant only)
+     * @param preMintId The pre-mint token ID to deactivate
+     */
+    function deactivatePreMintToken(uint256 preMintId) external {
+        require(preMintTokens[preMintId].merchant == msg.sender || hasRole(DEFAULT_ADMIN_ROLE, msg.sender), 
+                "Only merchant or admin can deactivate");
+        preMintTokens[preMintId].isActive = false;
+    }
+    
+    /**
+     * @dev Get pre-mint token details
+     * @param preMintId The pre-mint token ID
+     */
+    function getPreMintToken(uint256 preMintId) external view returns (PreMintToken memory) {
+        return preMintTokens[preMintId];
+    }
+    
+    /**
+     * @dev Check if payment intent has been processed
+     * @param paymentIntentId The payment intent ID to check
+     */
+    function isPaymentProcessed(string memory paymentIntentId) external view returns (bool) {
+        return paymentIntentToTokenId[paymentIntentId] != 0;
+    }
+    
+    /**
+     * @dev Get current pre-mint token counter
+     */
+    function getCurrentPreMintId() external view returns (uint256) {
+        return _preMintTokenCounter;
     }
 
     /**
