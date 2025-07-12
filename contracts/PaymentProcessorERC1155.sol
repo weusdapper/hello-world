@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
@@ -146,6 +146,43 @@ contract PaymentProcessorERC1155 is ERC1155, AccessControl, Pausable, Reentrancy
     }
 
     /**
+     * @dev Internal function to mint NFT for purchase (used by batch function)
+     */
+    function _mintForPurchase(
+        address customer,
+        uint256 tokenId,
+        uint256 amount,
+        string memory transactionId
+    ) internal {
+        require(tokenExists[tokenId], "Token does not exist");
+        require(amount > 0, "Amount must be greater than 0");
+        require(bytes(transactionId).length > 0, "Transaction ID required");
+        
+        bytes32 txHash = keccak256(abi.encodePacked(transactionId, tokenId, customer));
+        require(!processedTransactions[txHash], "Transaction already processed");
+        
+        // Check supply limits
+        if (maxSupply[tokenId] > 0) {
+            require(tokenSupply[tokenId] + amount <= maxSupply[tokenId], "Exceeds maximum supply");
+        }
+        
+        // Mark transaction as processed
+        processedTransactions[txHash] = true;
+        tokenSupply[tokenId] += amount;
+        
+        // Mint the NFT to customer
+        _mint(customer, tokenId, amount, "");
+        
+        emit NFTMintedForPurchase(
+            tokenId,
+            customer,
+            msg.sender, // merchant/processor
+            transactionId,
+            amount
+        );
+    }
+
+    /**
      * @dev Batch mint function for multiple purchases in one transaction
      * @param customers Array of customer addresses
      * @param tokenIds Array of token IDs
@@ -166,7 +203,7 @@ contract PaymentProcessorERC1155 is ERC1155, AccessControl, Pausable, Reentrancy
         );
         
         for (uint256 i = 0; i < customers.length; i++) {
-            mintForPurchase(customers[i], tokenIds[i], amounts[i], transactionIds[i], "");
+            _mintForPurchase(customers[i], tokenIds[i], amounts[i], transactionIds[i]);
         }
     }
 
@@ -302,15 +339,12 @@ contract PaymentProcessorERC1155 is ERC1155, AccessControl, Pausable, Reentrancy
     /**
      * @dev Hook that is called before any token transfer
      */
-    function _beforeTokenTransfer(
-        address operator,
+    function _update(
         address from,
         address to,
         uint256[] memory ids,
-        uint256[] memory amounts,
-        bytes memory data
+        uint256[] memory values
     ) internal override whenNotPaused {
-        super._beforeTokenTransfer(operator, from, to, ids, amounts, data);
+        super._update(from, to, ids, values);
     }
 }
-
